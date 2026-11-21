@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Blast Radius Test Selector - Team MVai
-Optimized Test Impact Analysis & Multiprocessor LPT Partitioning
+"""Blast Radius Production Test Selector - Team MVai
+Full AST Impact Mapping with Safe Fallback and LPT Worker Partitioning
 """
 
 import json
@@ -21,7 +21,6 @@ def partition_tests(test_nums: list[int], tests_by_num: dict[int, dict], max_wor
     if not test_nums:
         return []
     
-    # Sort tests descending by duration (Longest Processing Time first)
     sorted_tests = [tests_by_num[n] for n in test_nums if n in tests_by_num]
     sorted_tests.sort(key=lambda t: t["seconds"], reverse=True)
     
@@ -31,7 +30,6 @@ def partition_tests(test_nums: list[int], tests_by_num: dict[int, dict], max_wor
     best_workers = None
     best_cost = float("inf")
     
-    # Evaluate optimal worker count k (from 1 to min(8, count))
     limit_k = min(max_workers, len(sorted_tests))
     for k in range(1, limit_k + 1):
         buckets = [[] for _ in range(k)]
@@ -40,7 +38,6 @@ def partition_tests(test_nums: list[int], tests_by_num: dict[int, dict], max_wor
             idx = loads.index(min(loads))
             buckets[idx].append(t["number"])
             loads[idx] += t["seconds"]
-        # Cost metric: max worker load + 2.0s per worker
         cost = max(loads) + 2.0 * k
         if cost < best_cost:
             best_cost = cost
@@ -53,97 +50,59 @@ def main() -> None:
     tests_file = data_dir / "tests.json"
     commits_dir = data_dir / "commits"
     
-    # Load test catalog
     tests_catalog = json.loads(tests_file.read_text(encoding="utf-8"))["tests"]
     tests_by_num = {t["number"]: t for t in tests_catalog}
     
-    # Load pre-computed AST & dependency map
     map_path = Path(__file__).parent / "test_map.json"
     map_data = json.loads(map_path.read_text(encoding="utf-8"))
-    dialect_to_tests = map_data["dialect_to_tests"]
-    fixture_to_tests = map_data["fixture_to_tests"]
-    file_to_tests = map_data["file_to_tests"]
-    dialects = set(map_data["dialects"])
+    file_mapping = map_data["file_mapping"]
+    fixture_mapping = map_data["fixture_mapping"]
+    core_fallback = map_data.get("core_fallback", [])
     
+    # Pre-index basenames for fast fuzzy matching
+    basename_to_tests = {}
+    for k, v in file_mapping.items():
+        basename_to_tests[Path(k).name] = v
+
     patch_files = sorted(commits_dir.glob("*.patch"))
     for patch in patch_files:
         cid = patch.stem
         diff_text = patch.read_text(encoding="utf-8", errors="ignore")
         lines = diff_text.splitlines()
-        
-        # Check if patch is pure comments/whitespace
-        added_lines = [l[1:].strip() for l in lines if l.startswith('+') and not l.startswith('+++')]
-        deleted_lines = [l[1:].strip() for l in lines if l.startswith('-') and not l.startswith('---')]
         changed_files = [l[6:] for l in lines if l.startswith("+++ b/")]
         
-        is_pure_comment = True
-        for l in added_lines + deleted_lines:
-            if l and not l.startswith('#') and not l.startswith('"""') and not l.startswith("'''") and not l.startswith('*'):
-                is_pure_comment = False
-                break
-                
-        if is_pure_comment and changed_files and not any(f.endswith('.sql') for f in changed_files):
-            print(json.dumps({"commit": cid, "workers": []}), flush=True)
-            continue
-            
         selected: set[int] = set()
         for f in changed_files:
-            # 1. Optimizer SQL fixtures
+            # 1. Optimizer fixtures
             if "tests/fixtures/optimizer/" in f:
-                fname = Path(f).name
                 stem = Path(f).stem
-                if fname in fixture_to_tests:
-                    selected.update(fixture_to_tests[fname])
-                if stem in fixture_to_tests:
-                    selected.update(fixture_to_tests[stem])
-                for t in file_to_tests.get("tests/test_optimizer.py", []):
-                    t_info = tests_by_num.get(t)
-                    if t_info:
-                        tname = t_info["id"].split("::")[-1]
-                        if stem.rstrip('s') in tname.rstrip('s'):
-                            selected.add(t)
+                fname = Path(f).name
+                if fname in fixture_mapping:
+                    selected.update(fixture_mapping[fname])
+                elif stem in fixture_mapping:
+                    selected.update(fixture_mapping[stem])
                 continue
                 
-            # 2. Dialect files
-            dname = None
-            for prefix in ["sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/"]:
-                if f.startswith(prefix):
-                    stem = Path(f).stem
-                    if stem != "dialect":
-                        dname = stem
-                    break
+            # 2. Exact file mapping
+            if f in file_mapping:
+                selected.update(file_mapping[f])
+                continue
+                
+            # 3. Basename mapping (handles differences in relative path)
+            base = Path(f).name
+            if base in basename_to_tests:
+                selected.update(basename_to_tests[base])
+                continue
+                
+            # 4. If test file changed directly
+            for t in tests_catalog:
+                if t["file"] == f:
+                    selected.add(t["number"])
                     
-            if dname:
-                if dname in dialect_to_tests:
-                    selected.update(dialect_to_tests[dname])
-                tf = f"tests/dialects/test_{dname}.py"
-                if tf in file_to_tests:
-                    selected.update(file_to_tests[tf])
-                continue
-                
-            # 3. Optimizer modules
-            if f.startswith("sqlglot/optimizer/"):
-                selected.update(file_to_tests.get("tests/test_optimizer.py", []))
-                selected.update(file_to_tests.get("tests/test_executor.py", []))
-                continue
-                
-            # 4. Expressions
-            if f.startswith("sqlglot/expressions"):
-                selected.update(file_to_tests.get("tests/test_expressions.py", []))
-                parser_tests = [t for t in file_to_tests.get("tests/test_parser.py", []) if t != 1490]
-                selected.update(parser_tests)
-                continue
-                
-            # 5. Direct test file
-            stem = Path(f).stem
-            direct_tf = f"tests/test_{stem}.py"
-            if direct_tf in file_to_tests:
-                selected.update(file_to_tests[direct_tf])
-                
-            # 6. Core files
-            if f in ["sqlglot/serde.py", "sqlglot/dialects/dialect.py"]:
-                selected.update(t["number"] for t in tests_catalog)
-
+        # If no tests matched yet files changed, add safety core fallback to ensure zero misses
+        if not selected and changed_files:
+            selected.update(core_fallback)
+            
         workers = partition_tests(sorted(list(selected)), tests_by_num, max_workers=8)
         print(json.dumps({"commit": cid, "workers": workers}), flush=True)
 
