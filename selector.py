@@ -6,6 +6,7 @@ conservatively to the complete test catalog to avoid the 300-second miss penalty
 """
 
 import json
+import shlex
 from pathlib import Path
 
 
@@ -79,46 +80,41 @@ def partition_tests(
     return best or []
 
 
-def _unquote_git_path(path: str) -> str:
-    path = path.strip()
-    if path.startswith('"') and path.endswith('"'):
-        # Git's quoted path format uses C-style escapes. Decode common escapes.
-        path = path[1:-1]
-        path = path.replace(r"\\", "\\").replace(r'\"', '"').replace(r"\t", "\t")
-    return path
+def _git_path_tokens(text: str) -> list[str]:
+    """Parse Git's quoted/unquoted path tokens, including paths containing spaces."""
+    try:
+        return shlex.split(text, posix=True)
+    except ValueError:
+        return []
 
 
 def extract_changed_files(diff_text: str) -> list[str]:
-    """Read both sides of git diff headers, including deletes and renames."""
+    """Read both sides of git diff headers, including additions, deletions, and renames."""
     changed: set[str] = set()
     for line in diff_text.splitlines():
         if line.startswith("diff --git "):
-            # Git paths may be quoted. The conventional a/... b/... header is
-            # parsed from the final " b/" boundary to preserve spaces in paths.
-            header = line[len("diff --git "):]
-            split_at = header.rfind(" b/")
-            if split_at >= 0:
-                left = _unquote_git_path(header[:split_at])
-                right = _unquote_git_path(header[split_at + 1:])
+            tokens = _git_path_tokens(line[len("diff --git "):])
+            if len(tokens) == 2:
+                left, right = tokens
                 if left.startswith("a/"):
                     changed.add(left[2:])
                 if right.startswith("b/"):
                     changed.add(right[2:])
-        elif line.startswith("--- "):
-            path = _unquote_git_path(line[4:].split("\t", 1)[0])
-            if path.startswith("a/"):
-                changed.add(path[2:])
-        elif line.startswith("+++ "):
-            path = _unquote_git_path(line[4:].split("\t", 1)[0])
-            if path.startswith("b/"):
-                changed.add(path[2:])
+        elif line.startswith(("--- ", "+++ ")):
+            marker, value = line[:4], line[4:]
+            tokens = _git_path_tokens(value)
+            if tokens:
+                path = tokens[0]
+                if marker == "--- " and path.startswith("a/"):
+                    changed.add(path[2:])
+                elif marker == "+++ " and path.startswith("b/"):
+                    changed.add(path[2:])
         elif line.startswith("rename from "):
-            changed.add(_unquote_git_path(line[len("rename from "):]))
+            changed.add(line[len("rename from "):])
         elif line.startswith("rename to "):
-            changed.add(_unquote_git_path(line[len("rename to "):]))
+            changed.add(line[len("rename to "):])
     changed.discard("/dev/null")
     return sorted(changed)
-
 
 def main() -> None:
     root = Path(__file__).parent
@@ -166,12 +162,9 @@ def main() -> None:
                 selected.update(file_mapping[path])
                 continue
 
-            # Basename aliases can bridge package path variants, but multiple matches
-            # are unioned rather than silently choosing the last dictionary entry.
-            basename_matches = basename_to_tests.get(Path(path).name)
-            if basename_matches:
-                selected.update(basename_matches)
-                continue
+            # Never infer impact from a basename alone: unrelated packages can
+            # contain identically named modules. Unknown paths must fail safe.
+
 
             # Test helpers and every unrecognized path are conservative fallbacks.
             # Do not let a known file in the same patch hide an unknown changed file.
