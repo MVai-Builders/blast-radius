@@ -1,204 +1,192 @@
 #!/usr/bin/env python3
-"""Blast Radius Bulletproof Production Selector - Team MVai
-100% coverage across all 184 sqlglot source files and fixtures.
-Guarantees zero misses while minimizing worker load via dynamic LPT partitioning.
+"""Blast Radius test selector.
+
+Uses only repository-derived impact maps. Unknown or ambiguous changes fall back
+conservatively to the complete test catalog to avoid the 300-second miss penalty.
 """
 
 import json
-import math
-import sys
 from pathlib import Path
 
 
 def get_data_dir() -> Path:
-    p = Path("/data")
-    if p.exists() and (p / "tests.json").exists():
-        return p
+    data = Path("/data")
+    if (data / "tests.json").is_file():
+        return data
     sample = Path(__file__).parent / "sample"
-    if sample.exists() and (sample / "tests.json").exists():
+    if (sample / "tests.json").is_file():
         return sample
     return Path(".")
 
 
-def partition_tests(test_nums: list[int], tests_by_num: dict[int, dict], max_workers: int = 8) -> list[list[int]]:
-    if not test_nums:
+def partition_tests(
+    test_nums: list[int],
+    tests_by_num: dict[int, dict],
+    max_workers: int = 8,
+) -> list[list[int]]:
+    """Choose worker count and balance known test durations with LPT + pair swaps."""
+    tests = [tests_by_num[n] for n in set(test_nums) if n in tests_by_num]
+    if not tests:
         return []
+    tests.sort(key=lambda t: (-float(t["seconds"]), t["number"]))
 
-    sorted_tests = [tests_by_num[n] for n in test_nums if n in tests_by_num]
-    sorted_tests.sort(key=lambda t: t["seconds"], reverse=True)
+    best: list[list[int]] | None = None
+    best_cost = float("inf")
+    for worker_count in range(1, min(max_workers, len(tests)) + 1):
+        buckets: list[list[int]] = [[] for _ in range(worker_count)]
+        loads = [0.0] * worker_count
+        for test in tests:
+            index = min(range(worker_count), key=lambda i: (loads[i], i))
+            buckets[index].append(test["number"])
+            loads[index] += float(test["seconds"])
 
-    if not sorted_tests:
-        return []
+        # Deterministic best-improvement single-test moves. Never changes selection.
+        while True:
+            current_peak = max(loads)
+            move = None
+            best_peak = current_peak
+            for src in range(worker_count):
+                if loads[src] != current_peak:
+                    continue
+                for number in buckets[src]:
+                    duration = float(tests_by_num[number]["seconds"])
+                    for dst in range(worker_count):
+                        if dst == src:
+                            continue
+                        candidate_peak = max(
+                            loads[dst] + duration,
+                            *(loads[i] - duration if i == src else loads[i]
+                              for i in range(worker_count) if i != dst),
+                        )
+                        if candidate_peak + 1e-12 < best_peak:
+                            best_peak = candidate_peak
+                            move = (src, dst, number, duration)
+            if move is None:
+                break
+            src, dst, number, duration = move
+            buckets[src].remove(number)
+            buckets[dst].append(number)
+            loads[src] -= duration
+            loads[dst] += duration
 
-    best_workers = None
-    best_cost_ms = float("inf")
+        active = [bucket for bucket in buckets if bucket]
+        peak = max(sum(float(tests_by_num[n]["seconds"]) for n in b) for b in active)
+        cost = peak + 2.0 * len(active)
+        if cost < best_cost - 1e-12:
+            best_cost = cost
+            best = active
 
-    limit_k = min(max_workers, len(sorted_tests))
-    for k in range(1, limit_k + 1):
-        buckets = [[] for _ in range(k)]
-        loads = [0] * k
-        for t in sorted_tests:
-            idx = loads.index(min(loads))
-            buckets[idx].append(t["number"])
-            loads[idx] += round(t["seconds"] * 1000)
+    return best or []
 
-        # Local search 1-opt refinement to minimize peak worker load
-        improved = True
-        while improved:
-            improved = False
-            max_idx = loads.index(max(loads))
-            max_load = loads[max_idx]
-            for item in list(buckets[max_idx]):
-                item_ms = round(tests_by_num[item]["seconds"] * 1000)
-                for j in range(k):
-                    if j == max_idx:
-                        continue
-                    if loads[j] + item_ms < max_load:
-                        buckets[max_idx].remove(item)
-                        buckets[j].append(item)
-                        loads[max_idx] -= item_ms
-                        loads[j] += item_ms
-                        improved = True
-                        break
-                if improved:
-                    break
 
-        active = [b for b in buckets if b]
-        if active:
-            active_loads = [sum(round(tests_by_num[n]["seconds"] * 1000) for n in b) for b in active]
-            cost_ms = max(active_loads) + 2000 * len(active)
-            if cost_ms < best_cost_ms:
-                best_cost_ms = cost_ms
-                best_workers = active
-
-    return best_workers if best_workers else []
+def _unquote_git_path(path: str) -> str:
+    path = path.strip()
+    if path.startswith('"') and path.endswith('"'):
+        # Git's quoted path format uses C-style escapes. Decode common escapes.
+        path = path[1:-1]
+        path = path.replace(r"\\", "\\").replace(r'\"', '"').replace(r"\t", "\t")
+    return path
 
 
 def extract_changed_files(diff_text: str) -> list[str]:
-    """Robustly extract all modified/added/deleted/renamed files from unified diff."""
-    files = set()
+    """Read both sides of git diff headers, including deletes and renames."""
+    changed: set[str] = set()
     for line in diff_text.splitlines():
         if line.startswith("diff --git "):
-            parts = line.split()
-            if len(parts) >= 4:
-                a_path = parts[2]
-                b_path = parts[3]
-                if a_path.startswith("a/"):
-                    files.add(a_path[2:])
-                if b_path.startswith("b/"):
-                    files.add(b_path[2:])
-        elif line.startswith("--- a/"):
-            files.add(line[6:].strip())
-        elif line.startswith("+++ b/"):
-            files.add(line[6:].strip())
+            # Git paths may be quoted. The conventional a/... b/... header is
+            # parsed from the final " b/" boundary to preserve spaces in paths.
+            header = line[len("diff --git "):]
+            split_at = header.rfind(" b/")
+            if split_at >= 0:
+                left = _unquote_git_path(header[:split_at])
+                right = _unquote_git_path(header[split_at + 1:])
+                if left.startswith("a/"):
+                    changed.add(left[2:])
+                if right.startswith("b/"):
+                    changed.add(right[2:])
+        elif line.startswith("--- "):
+            path = _unquote_git_path(line[4:].split("\t", 1)[0])
+            if path.startswith("a/"):
+                changed.add(path[2:])
+        elif line.startswith("+++ "):
+            path = _unquote_git_path(line[4:].split("\t", 1)[0])
+            if path.startswith("b/"):
+                changed.add(path[2:])
         elif line.startswith("rename from "):
-            files.add(line[12:].strip())
+            changed.add(_unquote_git_path(line[len("rename from "):]))
         elif line.startswith("rename to "):
-            files.add(line[10:].strip())
-    files.discard("/dev/null")
-    return sorted(list(files))
-
-
-def is_pure_python_comment_diff(diff_text: str, changed_files: list[str]) -> bool:
-    """Check if the diff in python files only adds or removes comments or whitespace."""
-    if not changed_files or not all(f.endswith(".py") for f in changed_files):
-        return False
-    changed_code = False
-    for line in diff_text.splitlines():
-        if line.startswith(("+++", "---", "@@", "diff", "index")):
-            continue
-        if line.startswith(("+", "-")):
-            content = line[1:].strip()
-            if not content or content.startswith("#"):
-                continue
-            changed_code = True
-            break
-    return not changed_code
+            changed.add(_unquote_git_path(line[len("rename to "):]))
+    changed.discard("/dev/null")
+    return sorted(changed)
 
 
 def main() -> None:
+    root = Path(__file__).parent
     data_dir = get_data_dir()
-    tests_file = data_dir / "tests.json"
-    commits_dir = data_dir / "commits"
+    catalog = json.loads((data_dir / "tests.json").read_text(encoding="utf-8"))["tests"]
+    tests_by_num = {test["number"]: test for test in catalog}
+    tests_by_file: dict[str, set[int]] = {}
+    for test in catalog:
+        tests_by_file.setdefault(test["file"], set()).add(test["number"])
 
-    tests_catalog = json.loads(tests_file.read_text(encoding="utf-8"))["tests"]
-    tests_by_num = {t["number"]: t for t in tests_catalog}
-
-    # Group tests by test file for direct test modifications
-    tests_by_file: dict[str, list[int]] = {}
-    for t in tests_catalog:
-        tests_by_file.setdefault(t["file"], []).append(t["number"])
-
-    map_path = Path(__file__).parent / "test_map.json"
-    map_data = json.loads(map_path.read_text(encoding="utf-8"))
+    map_data = json.loads((root / "test_map.json").read_text(encoding="utf-8"))
     file_mapping = map_data["file_mapping"]
     fixture_mapping = map_data["fixture_mapping"]
-    full_fallback = map_data.get("full_fallback", [])
+    full_fallback = set(map_data.get("full_fallback", tests_by_num.keys()))
 
-    # Pre-index basenames for fallback fuzzy matching
-    basename_to_tests = {Path(k).name: v for k, v in file_mapping.items()}
+    basename_to_tests: dict[str, set[int]] = {}
+    for path, numbers in file_mapping.items():
+        basename_to_tests.setdefault(Path(path).name, set()).update(numbers)
 
-    patch_files = sorted(commits_dir.glob("*.patch"))
-    for patch in patch_files:
-        cid = patch.stem
-        diff_text = patch.read_text(encoding="utf-8", errors="ignore")
+    commits_dir = data_dir / "commits"
+    for patch in sorted(commits_dir.glob("*.patch")):
+        diff_text = patch.read_text(encoding="utf-8", errors="replace")
         changed_files = extract_changed_files(diff_text)
-
-        # Optimization 1: Pure python comments have zero effect on bytecode/tests
-        if is_pure_python_comment_diff(diff_text, changed_files):
-            print(json.dumps({"commit": cid, "workers": []}), flush=True)
-            continue
-
         selected: set[int] = set()
-        parser_touched = False
+        uncertain = False
 
-        for f in changed_files:
-            # Check if parser itself was modified
-            if "parser.py" in f or "parsers/base.py" in f:
-                parser_touched = True
-
-            # 1. Fixture files (optimizer or root fixtures)
-            if "fixtures" in f or f.endswith(".sql") or f.endswith(".json"):
-                fname = Path(f).name
-                stem = Path(f).stem
-                if fname in fixture_mapping:
-                    selected.update(fixture_mapping[fname])
-                elif stem in fixture_mapping:
-                    selected.update(fixture_mapping[stem])
+        for path in changed_files:
+            # Direct test edits must always run the edited test file's catalog entries.
+            if path in tests_by_file:
+                selected.update(tests_by_file[path])
                 continue
 
-            # 2. Exact match in file mapping
-            if f in file_mapping:
-                selected.update(file_mapping[f])
+            # Fixture edits use exact fixture mapping. An unmapped fixture is uncertain.
+            if "fixtures" in path or path.endswith((".sql", ".json")):
+                name, stem = Path(path).name, Path(path).stem
+                matches = fixture_mapping.get(name, fixture_mapping.get(stem))
+                if matches:
+                    selected.update(matches)
+                else:
+                    uncertain = True
                 continue
 
-            # 3. Direct modification of test files
-            if f in tests_by_file:
-                selected.update(tests_by_file[f])
+            # Exact source-file map.
+            if path in file_mapping:
+                selected.update(file_mapping[path])
                 continue
 
-            # 4. Basename match
-            base = Path(f).name
-            if base in basename_to_tests:
-                selected.update(basename_to_tests[base])
+            # Basename aliases can bridge package path variants, but multiple matches
+            # are unioned rather than silently choosing the last dictionary entry.
+            basename_matches = basename_to_tests.get(Path(path).name)
+            if basename_matches:
+                selected.update(basename_matches)
                 continue
 
-            # 5. Helper files inside tests/
-            if "tests/" in f:
-                for tf, tnums in tests_by_file.items():
-                    selected.update(tnums)
-                continue
+            # Test helpers and every unrecognized path are conservative fallbacks.
+            # Do not let a known file in the same patch hide an unknown changed file.
+            uncertain = True
 
-        # If any file changed but no tests matched, use the full safe fallback
-        if not selected and changed_files:
+        if uncertain:
+            selected.update(full_fallback)
+        elif not changed_files:
+            # Empty/unparseable patch: safest interpretation is unknown impact.
             selected.update(full_fallback)
 
-        # Only run test #1490 (28.8s test_max_nodes) if parser was actually modified
-        if not parser_touched:
-            selected.discard(1490)
-
-        workers = partition_tests(sorted(list(selected)), tests_by_num, max_workers=8)
-        print(json.dumps({"commit": cid, "workers": workers}), flush=True)
+        # Do not prune "expensive" parser tests based on a filename heuristic:
+        # parser behavior can be affected by dialect parsers, shared bases, and helpers.
+        workers = partition_tests(sorted(selected), tests_by_num)
+        print(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")), flush=True)
 
 
 if __name__ == "__main__":
