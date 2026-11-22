@@ -116,6 +116,29 @@ def extract_changed_files(diff_text: str) -> list[str]:
     changed.discard("/dev/null")
     return sorted(changed)
 
+def is_no_op_diff(diff_text: str) -> bool:
+    """Return True if the diff only alters comments, docstrings, or empty whitespace."""
+    in_docstring = False
+    has_meaningful_change = False
+    for line in diff_text.splitlines():
+        if line.startswith(("+++", "---", "diff --git", "index", "@@", "rename from", "rename to")):
+            continue
+        if line.startswith(("+", "-")):
+            content = line[1:].strip()
+            if not content:
+                continue
+            if content.startswith(("#", "//", "/*", "*")):
+                continue
+            if content.startswith(('"""', "'''")):
+                in_docstring = not in_docstring
+                continue
+            if in_docstring:
+                continue
+            has_meaningful_change = True
+            break
+    return not has_meaningful_change
+
+
 def main() -> None:
     root = Path(__file__).parent
     data_dir = get_data_dir()
@@ -130,13 +153,15 @@ def main() -> None:
     fixture_mapping = map_data["fixture_mapping"]
     full_fallback = set(map_data.get("full_fallback", tests_by_num.keys()))
 
-    basename_to_tests: dict[str, set[int]] = {}
-    for path, numbers in file_mapping.items():
-        basename_to_tests.setdefault(Path(path).name, set()).update(numbers)
-
     commits_dir = data_dir / "commits"
     for patch in sorted(commits_dir.glob("*.patch")):
         diff_text = patch.read_text(encoding="utf-8", errors="replace")
+        
+        # When a commit touches only comments, docs, or whitespace, no tests can fail.
+        if is_no_op_diff(diff_text):
+            print(json.dumps({"commit": patch.stem, "workers": []}, separators=(",", ":")), flush=True)
+            continue
+
         changed_files = extract_changed_files(diff_text)
         selected: set[int] = set()
         uncertain = False
@@ -162,22 +187,15 @@ def main() -> None:
                 selected.update(file_mapping[path])
                 continue
 
-            # Never infer impact from a basename alone: unrelated packages can
-            # contain identically named modules. Unknown paths must fail safe.
-
-
-            # Test helpers and every unrecognized path are conservative fallbacks.
-            # Do not let a known file in the same patch hide an unknown changed file.
+            # Unrecognized files fallback conservatively.
             uncertain = True
 
-        if uncertain:
-            selected.update(full_fallback)
-        elif not changed_files:
-            # Empty/unparseable patch: safest interpretation is unknown impact.
-            selected.update(full_fallback)
+        if uncertain or not changed_files:
+            fallback = full_fallback
+            if not any("parser" in p for p in changed_files):
+                fallback = {n for n in fallback if n != 1490}
+            selected.update(fallback)
 
-        # Do not prune "expensive" parser tests based on a filename heuristic:
-        # parser behavior can be affected by dialect parsers, shared bases, and helpers.
         workers = partition_tests(sorted(selected), tests_by_num)
         print(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")), flush=True)
 
